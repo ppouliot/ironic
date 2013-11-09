@@ -84,6 +84,21 @@ def make_partitions(dev, root_mb, swap_mb):
     # avoid "device is busy"
     time.sleep(3)
 
+def make_partition_windows(dev, root_mb):
+    """Create a single partition for Windows on a disk device."""
+    # Lead in with 1MB to allow room for the partition table itself, otherwise
+    # the way sfdisk adjusts doesn't shift the partition up to compensate, and
+    # we lose the space.
+    # http://bazaar.launchpad.net/~ubuntu-branches/ubuntu/raring/util-linux/
+    # raring/view/head:/fdisk/sfdisk.c#L1940
+    stdin_command = ('1,%d,83;\n0,0;\n0,0;\n' % (root_mb))
+    utils.execute('sfdisk', '-uM', dev, process_input=stdin_command,
+            run_as_root=True,
+            attempts=3,
+            check_exit_code=[0])
+    # avoid "device is busy"
+    time.sleep(3)
+
 
 def is_block_device(dev):
     """Check whether a device is block or not."""
@@ -185,6 +200,28 @@ def work_on_disk(dev, root_mb, swap_mb, image_path):
     return root_uuid
 
 
+def work_on_windows_disk(dev, root_mb, image_path):
+    """Creates a partition and write an image to the root partition."""
+    root_part = "%s-part1" % dev
+
+    if not is_block_device(dev):
+        LOG.warn(_("parent device '%s' not found"), dev)
+        return
+    make_windows_partition(dev, root_mb)
+    if not is_block_device(root_part):
+        LOG.warn(_("root device '%s' not found"), root_part)
+        return
+    dd(image_path, root_part)
+
+    try:
+        root_uuid = block_uuid(root_part)
+    except exception.ProcessExecutionError:
+        with excutils.save_and_reraise_exception():
+            LOG.error(_("Failed to detect root device UUID."))
+    return root_uuid
+
+
+
 def deploy(address, port, iqn, lun, image_path, pxe_config_path,
            root_mb, swap_mb):
     """All-in-one function to deploy a node."""
@@ -209,3 +246,29 @@ def deploy(address, port, iqn, lun, image_path, pxe_config_path,
     # Ensure the node started netcat on the port after POST the request.
     time.sleep(3)
     notify(address, 10000)
+
+def deploy_windows(address, port, iqn, lun, image_path, pxe_config_path,
+           root_mb):
+    """All-in-one function to deploy a windows node."""
+    dev = get_dev(address, port, iqn, lun)
+    image_mb = get_image_mb(image_path)
+    if image_mb > root_mb:
+        root_mb = image_mb
+    discovery(address, port)
+    login_iscsi(address, port, iqn)
+    try:
+        root_uuid = work_on_windows_disk(dev, root_mb, image_path)
+    except exception.ProcessExecutionError as err:
+        with excutils.save_and_reraise_exception():
+            # Log output if there was a error
+            LOG.error(_("Deploy to address %s failed.") % address)
+            LOG.error(_("Command: %s") % err.cmd)
+            LOG.error(_("StdOut: %r") % err.stdout)
+            LOG.error(_("StdErr: %r") % err.stderr)
+    finally:
+        logout_iscsi(address, port, iqn)
+    switch_pxe_config(pxe_config_path, root_uuid)
+    # Ensure the node started netcat on the port after POST the request.
+    time.sleep(3)
+    notify(address, 10000)
+
